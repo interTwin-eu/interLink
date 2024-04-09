@@ -5,25 +5,61 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"strconv"
 	"time"
 
-	commonIL "github.com/intertwin-eu/interlink/pkg/common"
-
 	"github.com/containerd/containerd/log"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/tools/clientcmd"
+
+	commonIL "github.com/intertwin-eu/interlink/pkg/interlink"
 )
 
-var ClientSet *kubernetes.Clientset
+// PingInterLink pings the InterLink API and returns true if there's an answer. The second return value is given by the answer provided by the API.
+func PingInterLink(ctx context.Context, config VirtualKubeletConfig) (bool, int, error) {
+	log.G(ctx).Info("Pinging: " + config.Interlinkurl + ":" + config.Interlinkport + "/pinglink")
+	retVal := -1
+	req, err := http.NewRequest(http.MethodPost, config.Interlinkurl+":"+config.Interlinkport+"/pinglink", nil)
+
+	if err != nil {
+		log.G(ctx).Error(err)
+	}
+
+	token, err := os.ReadFile(config.VKTokenFile) // just pass the file name
+	if err != nil {
+		log.G(ctx).Error(err)
+		return false, retVal, err
+	}
+	req.Header.Add("Authorization", "Bearer "+string(token))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return false, retVal, err
+	}
+
+	if resp.StatusCode == http.StatusOK {
+		retBytes, err := io.ReadAll(resp.Body)
+		if err != nil {
+			log.G(ctx).Error(err)
+			return false, retVal, err
+		}
+		retVal, err = strconv.Atoi(string(retBytes))
+		if err != nil {
+			log.G(ctx).Error(err)
+			return false, retVal, err
+		}
+		return true, retVal, nil
+	} else {
+		log.G(ctx).Error("server error: " + fmt.Sprint(resp.StatusCode))
+		return false, retVal, nil
+	}
+}
 
 // updateCacheRequest is called when the VK receives the status of a pod already deleted. It performs a REST call InterLink API to update the cache deleting that pod from the cached structure
-func updateCacheRequest(config commonIL.InterLinkConfig, uid string, token string) error {
+func updateCacheRequest(config VirtualKubeletConfig, uid string, token string) error {
 	bodyBytes := []byte(uid)
 
 	reader := bytes.NewReader(bodyBytes)
@@ -51,7 +87,7 @@ func updateCacheRequest(config commonIL.InterLinkConfig, uid string, token strin
 
 // createRequest performs a REST call to the InterLink API when a Pod is registered to the VK. It Marshals the pod with already retrieved ConfigMaps and Secrets and sends it to InterLink.
 // Returns the call response expressed in bytes and/or the first encountered error
-func createRequest(config commonIL.InterLinkConfig, pod commonIL.PodCreateRequests, token string) ([]byte, error) {
+func createRequest(config VirtualKubeletConfig, pod commonIL.PodCreateRequests, token string) ([]byte, error) {
 	var returnValue, _ = json.Marshal(commonIL.PodStatus{})
 
 	bodyBytes, err := json.Marshal(pod)
@@ -83,7 +119,6 @@ func createRequest(config commonIL.InterLinkConfig, pod commonIL.PodCreateReques
 			log.L.Error(err)
 			return nil, err
 		}
-		log.G(context.Background()).Info(string(returnValue))
 	}
 
 	return returnValue, nil
@@ -91,7 +126,7 @@ func createRequest(config commonIL.InterLinkConfig, pod commonIL.PodCreateReques
 
 // deleteRequest performs a REST call to the InterLink API when a Pod is deleted from the VK. It Marshals the standard v1.Pod struct and sends it to InterLink.
 // Returns the call response expressed in bytes and/or the first encountered error
-func deleteRequest(config commonIL.InterLinkConfig, pod *v1.Pod, token string) ([]byte, error) {
+func deleteRequest(config VirtualKubeletConfig, pod *v1.Pod, token string) ([]byte, error) {
 	bodyBytes, err := json.Marshal(pod)
 	if err != nil {
 		log.G(context.Background()).Error(err)
@@ -136,13 +171,9 @@ func deleteRequest(config commonIL.InterLinkConfig, pod *v1.Pod, token string) (
 // statusRequest performs a REST call to the InterLink API when the VK needs an update on its Pods' status. A Marshalled slice of v1.Pod is sent to the InterLink API,
 // to query the below plugin for their status.
 // Returns the call response expressed in bytes and/or the first encountered error
-func statusRequest(config commonIL.InterLinkConfig, podsList []*v1.Pod, token string) ([]byte, error) {
+func statusRequest(config VirtualKubeletConfig, podsList []*v1.Pod, token string) ([]byte, error) {
 	var returnValue []byte
 
-	if len(podsList) == 0 {
-		log.L.Info("No PODs to monitor")
-		return nil, nil
-	}
 	bodyBytes, err := json.Marshal(podsList)
 	if err != nil {
 		log.L.Error(err)
@@ -181,7 +212,7 @@ func statusRequest(config commonIL.InterLinkConfig, podsList []*v1.Pod, token st
 // LogRetrieval performs a REST call to the InterLink API when the user ask for a log retrieval. Compared to create/delete/status request, a way smaller struct is marshalled and sent.
 // This struct only includes a minimum data set needed to identify the job/container to get the logs from.
 // Returns the call response and/or the first encountered error
-func LogRetrieval(ctx context.Context, config commonIL.InterLinkConfig, logsRequest commonIL.LogStruct) (io.ReadCloser, error) {
+func LogRetrieval(ctx context.Context, config VirtualKubeletConfig, logsRequest commonIL.LogStruct) (io.ReadCloser, error) {
 	b, err := os.ReadFile(config.VKTokenFile) // just pass the file name
 	if err != nil {
 		log.G(ctx).Fatal(err)
@@ -223,7 +254,7 @@ func LogRetrieval(ctx context.Context, config commonIL.InterLinkConfig, logsRequ
 // Depending on the mode (CREATE/DELETE), it performs different actions, making different REST calls.
 // Note: for the CREATE mode, the function gets stuck up to 5 minutes waiting for every missing ConfigMap/Secret.
 // If after 5m they are not still available, the function errors out
-func RemoteExecution(ctx context.Context, config commonIL.InterLinkConfig, p *VirtualKubeletProvider, pod *v1.Pod, mode int8) error {
+func RemoteExecution(ctx context.Context, config VirtualKubeletConfig, p *VirtualKubeletProvider, pod *v1.Pod, mode int8) error {
 
 	b, err := os.ReadFile(config.VKTokenFile) // just pass the file name
 	if err != nil {
@@ -241,25 +272,11 @@ func RemoteExecution(ctx context.Context, config commonIL.InterLinkConfig, p *Vi
 		for {
 			timeNow := time.Now()
 			if timeNow.Sub(startTime).Seconds() < time.Hour.Minutes()*5 {
-				if ClientSet == nil {
-					kubeconfig := os.Getenv("KUBECONFIG")
 
-					config, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
-					if err != nil {
-						log.G(ctx).Error(err)
-						return err
-					}
-
-					ClientSet, err = kubernetes.NewForConfig(config)
-					if err != nil {
-						log.G(ctx).Error(err)
-						return err
-					}
-				}
-
-				_, err := ClientSet.CoreV1().Pods(pod.Namespace).Get(ctx, pod.Name, metav1.GetOptions{})
+				_, err := p.clientSet.CoreV1().Pods(pod.Namespace).Get(ctx, pod.Name, metav1.GetOptions{})
 				if err != nil {
-					return errors.New("Deleted pod before actual creation")
+					log.G(ctx).Warning("Deleted Pod before actual creation")
+					return nil
 				}
 
 				var failed bool
@@ -267,7 +284,7 @@ func RemoteExecution(ctx context.Context, config commonIL.InterLinkConfig, p *Vi
 				for _, volume := range pod.Spec.Volumes {
 
 					if volume.ConfigMap != nil {
-						cfgmap, err := ClientSet.CoreV1().ConfigMaps(pod.Namespace).Get(ctx, volume.ConfigMap.Name, metav1.GetOptions{})
+						cfgmap, err := p.clientSet.CoreV1().ConfigMaps(pod.Namespace).Get(ctx, volume.ConfigMap.Name, metav1.GetOptions{})
 						if err != nil {
 							failed = true
 							log.G(ctx).Warning("Unable to find ConfigMap " + volume.ConfigMap.Name + " for pod " + pod.Name + ". Waiting for it to be initialized")
@@ -280,7 +297,7 @@ func RemoteExecution(ctx context.Context, config commonIL.InterLinkConfig, p *Vi
 							req.ConfigMaps = append(req.ConfigMaps, *cfgmap)
 						}
 					} else if volume.Secret != nil {
-						scrt, err := ClientSet.CoreV1().Secrets(pod.Namespace).Get(ctx, volume.Secret.SecretName, metav1.GetOptions{})
+						scrt, err := p.clientSet.CoreV1().Secrets(pod.Namespace).Get(ctx, volume.Secret.SecretName, metav1.GetOptions{})
 						if err != nil {
 							failed = true
 							log.G(ctx).Warning("Unable to find Secret " + volume.Secret.SecretName + " for pod " + pod.Name + ". Waiting for it to be initialized")
@@ -306,17 +323,16 @@ func RemoteExecution(ctx context.Context, config commonIL.InterLinkConfig, p *Vi
 			} else {
 				pod.Status.Phase = v1.PodFailed
 				pod.Status.Reason = "CFGMaps/Secrets not found"
-				for _, ct := range pod.Status.ContainerStatuses {
-					ct.Ready = false
+				for i, _ := range pod.Status.ContainerStatuses {
+					pod.Status.ContainerStatuses[i].Ready = false
 				}
 				p.UpdatePod(ctx, pod)
-				return errors.New("Unable to retrieve ConfigMaps or Secrets. Check logs.")
+				return errors.New("unable to retrieve ConfigMaps or Secrets. Check logs")
 			}
 		}
 
 		returnVal, err := createRequest(config, req, token)
 		if err != nil {
-			log.G(ctx).Error(err)
 			return err
 		}
 		log.G(ctx).Info(string(returnVal))
@@ -326,7 +342,6 @@ func RemoteExecution(ctx context.Context, config commonIL.InterLinkConfig, p *Vi
 		if pod.Status.Phase != "Initializing" {
 			returnVal, err := deleteRequest(config, req, token)
 			if err != nil {
-				log.G(ctx).Error(err)
 				return err
 			}
 			log.G(ctx).Info(string(returnVal))
@@ -338,37 +353,30 @@ func RemoteExecution(ctx context.Context, config commonIL.InterLinkConfig, p *Vi
 // checkPodsStatus is regularly called by the VK itself at regular intervals of time to query InterLink for Pods' status.
 // It basically append all available pods registered to the VK to a slice and passes this slice to the statusRequest function.
 // After the statusRequest returns a response, this function uses that response to update every Pod and Container status.
-func checkPodsStatus(ctx context.Context, p *VirtualKubeletProvider, token string, config commonIL.InterLinkConfig) error {
-	if len(p.pods) == 0 {
-		return nil
-	}
+func checkPodsStatus(ctx context.Context, p *VirtualKubeletProvider, podsList []*v1.Pod, token string, config VirtualKubeletConfig) ([]commonIL.PodStatus, error) {
 	var returnVal []byte
 	var ret []commonIL.PodStatus
-	var PodsList []*v1.Pod
 	var err error
 
-	for _, pod := range p.pods {
-		PodsList = append(PodsList, pod)
-	}
 	//log.G(ctx).Debug(p.pods) //commented out because it's too verbose. uncomment to see all registered pods
 
-	if PodsList != nil {
-		returnVal, err = statusRequest(config, PodsList, token)
-		if err != nil {
-			return err
-		} else if returnVal != nil {
-			err = json.Unmarshal(returnVal, &ret)
-			if err != nil {
-				return err
-			}
+	returnVal, err = statusRequest(config, podsList, token)
 
+	if err != nil {
+		return nil, err
+	} else if returnVal != nil {
+		err = json.Unmarshal(returnVal, &ret)
+		if err != nil {
+			return nil, err
+		}
+		if podsList != nil {
 			for _, podStatus := range ret {
 
 				pod, err := p.GetPod(ctx, podStatus.PodNamespace, podStatus.PodName)
 				if err != nil {
 					updateCacheRequest(config, podStatus.PodUID, token)
 					log.G(ctx).Warning("Error: " + err.Error() + "while getting statuses. Updating InterLink cache")
-					return err
+					return nil, err
 				}
 
 				if podStatus.PodUID == string(pod.UID) {
@@ -428,15 +436,19 @@ func checkPodsStatus(ctx context.Context, p *VirtualKubeletProvider, token strin
 					err = p.UpdatePod(ctx, pod)
 					if err != nil {
 						log.G(ctx).Error(err)
-						return err
+						return nil, err
 					}
 				}
 			}
 
 			log.G(ctx).Info("No errors while getting statuses")
 			log.G(ctx).Debug(ret)
-			return nil
+			return nil, nil
+		} else {
+			return ret, err
 		}
+
 	}
-	return err
+
+	return nil, err
 }

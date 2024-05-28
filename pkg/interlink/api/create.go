@@ -15,6 +15,7 @@ import (
 func (h *InterLinkHandler) CreateHandler(w http.ResponseWriter, r *http.Request) {
 	log.G(h.Ctx).Info("InterLink: received Create call")
 
+	var returnedJID commonIL.CreateStruct
 	statusCode := -1
 
 	bodyBytes, err := io.ReadAll(r.Body)
@@ -35,22 +36,22 @@ func (h *InterLinkHandler) CreateHandler(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	var retrievedData []commonIL.RetrievedPodData
+	var retrievedData commonIL.RetrievedPodData
 
-	data := commonIL.RetrievedPodData{}
-	if h.Config.ExportPodData {
-		data, err = getData(h.Ctx, h.Config, pod)
-		if err != nil {
-			statusCode = http.StatusInternalServerError
-			log.G(h.Ctx).Fatal(err)
-			w.WriteHeader(statusCode)
-			return
+	if !checkIfDeleted(string(pod.Pod.UID)) {
+		data := commonIL.RetrievedPodData{}
+		if h.Config.ExportPodData {
+			data, err = getData(h.Ctx, h.Config, pod)
+			if err != nil {
+				statusCode = http.StatusInternalServerError
+				log.G(h.Ctx).Fatal(err)
+				w.WriteHeader(statusCode)
+				return
+			}
 		}
-	}
 
-	retrievedData = append(retrievedData, data)
+		retrievedData = data
 
-	if retrievedData != nil {
 		bodyBytes, err = json.Marshal(retrievedData)
 		if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
@@ -60,7 +61,6 @@ func (h *InterLinkHandler) CreateHandler(w http.ResponseWriter, r *http.Request)
 		log.G(h.Ctx).Debug(string(bodyBytes))
 		reader := bytes.NewReader(bodyBytes)
 
-		log.G(h.Ctx).Info(req)
 		req, err = http.NewRequest(http.MethodPost, h.Config.Sidecarurl+":"+h.Config.Sidecarport+"/create", reader)
 
 		if err != nil {
@@ -92,7 +92,19 @@ func (h *InterLinkHandler) CreateHandler(w http.ResponseWriter, r *http.Request)
 
 		returnValue, _ := io.ReadAll(resp.Body)
 		log.G(h.Ctx).Debug(string(returnValue))
+
+		json.Unmarshal(returnValue, &returnedJID)
+
+		status := PodStatuses.Statuses[returnedJID.PodUID]
+		status.JobID = returnedJID.PodJID
+
+		PodStatuses.Add(status)
+
 		w.WriteHeader(statusCode)
 		w.Write(returnValue)
+	} else {
+		w.WriteHeader(statusCode)
+		w.Write(nil)
 	}
+
 }

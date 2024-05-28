@@ -14,8 +14,8 @@ import (
 
 func main() {
 	var cancel context.CancelFunc
-	api.PodStatuses.Statuses = make(map[string]commonIL.PodStatus)
-
+	api.PodStatuses.Init()
+	api.DeletedPods.Init()
 	interLinkConfig, err := commonIL.NewInterLinkConfig()
 	if err != nil {
 		panic(err)
@@ -35,6 +35,11 @@ func main() {
 	defer cancel()
 
 	log.G(ctx).Info(interLinkConfig)
+
+	err = api.LoadCache(ctx, interLinkConfig)
+	if err != nil {
+		log.G(ctx).Error(err)
+	}
 
 	interLinkAPIs := api.InterLinkHandler{
 		Config: interLinkConfig,
